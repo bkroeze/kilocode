@@ -13,6 +13,7 @@ import { ProjectTable } from "@opencode/core/project/sql"
 import { Rpc } from "@opencode/core/rpc"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Session } from "@opencode/core/session"
+import { ShellSelect } from "@opencode/core/shell/select"
 import { SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import type { Context } from "@opencode/plugin/effect/plugin"
@@ -72,6 +73,8 @@ function setup(
     flags?: string
     store?: Map<string, Schema.Json>
     projectID?: Project.ID
+    /** The shell the tool runs commands in; `null` leaves the shell service out. */
+    shell?: string | null
   } = {},
 ) {
   return Effect.gen(function* () {
@@ -121,9 +124,21 @@ function setup(
       },
       rpc: { register: rpc.register },
     }
-    yield* installPermissionSets(ctx).pipe(
+    const installed = installPermissionSets(ctx).pipe(
       Effect.provide(Flag.testLayer([], { overrides: input.flags ?? "permission_setup" })),
     )
+    yield* input.shell === null
+      ? installed
+      : installed.pipe(
+          Effect.provideService(
+            ShellSelect.Service,
+            ShellSelect.Service.of({
+              resolve: () => Effect.succeed(input.shell ?? "/bin/bash"),
+              transform: () => Effect.die("unused shell.transform"),
+              reload: () => Effect.die("unused shell.reload"),
+            }),
+          ),
+        )
     return {
       store,
       hooks,
@@ -183,6 +198,40 @@ describe("KiloPermissionsPlugin", () => {
       })
     }),
   )
+
+  it.effect("reads a shell ask in the dialect of the shell that runs it", () =>
+    Effect.gen(function* () {
+      const { call } = yield* setup({ shell: "pwsh" })
+      const permission = yield* Permission.Service
+      yield* call("apply", { presetID: "typescript-checks" })
+      expect(yield* permission.ask(shell(["bun run test"]))).toMatchObject({ effect: "allow" })
+      // PowerShell splats `@a` into arguments and takes `\\` as a path separator.
+      expect(yield* permission.ask(shell(["bun run test @a"]))).toMatchObject({ effect: "ask" })
+      expect(yield* permission.ask(shell(["bun test C:\\Temp\\evil.test.ts"]))).toMatchObject({ effect: "ask" })
+      expect(
+        yield* call("check", { presetID: "typescript-checks", commands: ["bun run test @a", "bun run test"] }),
+      ).toMatchObject({
+        results: [
+          { command: "bun run test @a", missing: ["bun run test @a"] },
+          { command: "bun run test", missing: [] },
+        ],
+      })
+    }),
+  )
+
+  for (const variant of [
+    { name: "a shell the scanner does not model", shell: "cmd.exe" },
+    { name: "no shell service", shell: null },
+  ]) {
+    it.effect(`covers nothing with ${variant.name}`, () =>
+      Effect.gen(function* () {
+        const { call } = yield* setup({ shell: variant.shell })
+        const permission = yield* Permission.Service
+        yield* call("apply", { presetID: "typescript-checks" })
+        expect(yield* permission.ask(shell(["bun run test"]))).toMatchObject({ effect: "ask" })
+      }),
+    )
+  }
 
   it.effect("removes one applied set and keeps the others and the decision", () =>
     Effect.gen(function* () {
@@ -418,10 +467,7 @@ describe("KiloPermissionsPlugin", () => {
         expect(parts[1]).not.toHaveProperty("exact")
       } else {
         expect(inspected).toMatchObject({
-          parts: [
-            { exact: "foo this" },
-            { exact: "bar that" },
-          ],
+          parts: [{ exact: "foo this" }, { exact: "bar that" }],
         })
       }
 

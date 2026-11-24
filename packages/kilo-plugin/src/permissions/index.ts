@@ -7,6 +7,7 @@
 import { Flag } from "@opencode/core/flag"
 import { Permission } from "@opencode/core/permission"
 import { PermissionSaved } from "@opencode/core/permission/saved"
+import { ShellSelect } from "@opencode/core/shell/select"
 import { define, type Context } from "@opencode/plugin/effect/plugin"
 import { KiloPermission } from "@opencode/schema/kilocode/permission"
 import { KiloPermissionsRpc } from "@opencode/schema/kilocode/permissions"
@@ -36,6 +37,12 @@ export const installPermissionSets = Effect.fn("KiloPermissionsPlugin")(function
     : false
   const permission = yield* Effect.serviceOption(Permission.Service)
   const saved = yield* PermissionSaved.Service
+  // The shell tool runs commands in this shell, and a set reads a command in the same dialect. A `create.before`
+  // hook that changes the shell of one call is not seen here. Without the service no set covers a command.
+  const shellSelect = yield* Effect.serviceOption(ShellSelect.Service)
+  const shell = Option.isSome(shellSelect)
+    ? shellSelect.value.resolve({ priority: "compat" })
+    : Effect.succeed(undefined)
   const projectID = ctx.location.project.id
   // Every repository without a remote or a commit shares the global project, so state keyed by it would carry one
   // repository's sets into another. Sets stay off there until the repository has an identity of its own.
@@ -71,9 +78,11 @@ export const installPermissionSets = Effect.fn("KiloPermissionsPlugin")(function
   const drain = Effect.gen(function* () {
     if (Option.isNone(permission)) return
     const rules = (yield* applied()).flatMap((set) => set.resources)
+    const dialect = yield* shell
+    if (dialect === undefined) return
     for (const request of yield* permission.value.list()) {
       if (request.action !== "shell" || KiloPermission.requiresPerson(request.metadata)) continue
-      if (!request.resources.every((resource) => covers(resource, rules, directory))) continue
+      if (!request.resources.every((resource) => covers(resource, rules, directory, dialect))) continue
       const allowed = yield* permission.value
         .allows({ ...request })
         .pipe(Effect.catchTag("Session.NotFoundError", () => Effect.succeed(false)))
@@ -106,12 +115,15 @@ export const installPermissionSets = Effect.fn("KiloPermissionsPlugin")(function
         if (KiloPermission.requiresPerson(event.metadata)) return
         const sets = yield* applied()
         if (sets.length === 0) return
+        const dialect = yield* shell
+        if (dialect === undefined) return
         const covered = allowsRequest({
           action: event.action,
           resources: event.resources,
           rules: event.rules ?? [],
           applied: sets.flatMap((set) => set.resources),
           directory,
+          shell: dialect,
         })
         if (covered) event.effect = "allow"
       }),
@@ -192,8 +204,13 @@ export const installPermissionSets = Effect.fn("KiloPermissionsPlugin")(function
             : presets.find((preset) => preset.id.endsWith("-install"))
           if (selected === undefined)
             return yield* Effect.fail(context.error("not_applicable", "The permission set does not apply"))
+          const dialect = yield* shell
+          if (dialect === undefined)
+            return yield* Effect.fail(context.error("unavailable", "The shell is not available"))
           const results = yield* Effect.forEach(input.commands, (command) =>
-            missing(command, directory, selected.resources).pipe(Effect.map((parts) => ({ command, missing: parts }))),
+            missing(command, directory, selected.resources, dialect).pipe(
+              Effect.map((parts) => ({ command, missing: parts })),
+            ),
           )
           return { presetID: selected.id, results }
         }),

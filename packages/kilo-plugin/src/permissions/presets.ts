@@ -42,8 +42,10 @@ const genericStems = (manager: PackageManager) => [
   `${manager} run build`,
   `${manager} test`,
   ...(manager === "bun" || manager === "pnpm" || manager === "yarn"
-    ? [`${manager} typecheck`, `${manager} lint`, `${manager} check`, `${manager} build`]
+    ? [`${manager} typecheck`, `${manager} lint`, `${manager} check`]
     : []),
+  // `bun build` is Bun's bundler, which writes any file through `--outfile`; only pnpm and yarn run the script.
+  ...(manager === "pnpm" || manager === "yarn" ? [`${manager} build`] : []),
   `${manager} --version`,
   `${manager} -v`,
   `${manager} --help`,
