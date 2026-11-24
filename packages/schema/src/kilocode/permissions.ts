@@ -1,11 +1,13 @@
 export * as KiloPermissionsRpc from "./permissions.js"
 
 import { Schema } from "effect"
+import { Permission } from "../permission.js"
 import { Project } from "../project.js"
 import { Rpc } from "../rpc.js"
 import { optional } from "../schema.js"
 
-// The `kilocode.permissions` RPC contract: the project permission set offer. The permissions plugin in
+// The `kilocode.permissions` RPC contract: the project permission set offer, and narrowed shell approvals that
+// show and save only the commands of a request that still need approval. The permissions plugin in
 // packages/kilo-plugin owns the applied sets and allows matching shell requests through the permission evaluate hook;
 // applied sets are not saved permission grants.
 const portable = Schema.toStandardSchemaV1
@@ -54,6 +56,23 @@ export const CheckOutput = Schema.Struct({
   presetID: PresetID,
   results: Schema.Array(CheckResult),
 }).annotate({ identifier: "KiloPermissions.CheckOutput" })
+
+export interface RequestPart extends Schema.Schema.Type<typeof RequestPart> {}
+export const RequestPart = Schema.Struct({
+  /** One command of the shell request, as the shell tool asked for it. */
+  resource: Schema.String,
+  /** The rule the shell tool offers to save for this command, usually its prefix with a trailing wildcard. */
+  rule: Schema.String,
+  /** The command itself as a rule; omitted when it equals `rule` or would match more than the command. */
+  exact: optional(Schema.String),
+  /** The rules, permission sets and hooks already allow this command; it needs no approval. */
+  allowed: Schema.Boolean,
+}).annotate({ identifier: "KiloPermissions.RequestPart" })
+
+export interface InspectOutput extends Schema.Schema.Type<typeof InspectOutput> {}
+export const InspectOutput = Schema.Struct({
+  parts: Schema.Array(RequestPart),
+}).annotate({ identifier: "KiloPermissions.InspectOutput" })
 
 const Empty = Schema.Struct({})
 const unavailable = { unavailable: portable(Schema.Undefined) }
@@ -104,6 +123,26 @@ export const Definition = Rpc.define({
     check: {
       input: portable(Schema.Struct({ presetID: optional(PresetID), commands: Schema.Array(Schema.String) })),
       output: portable(CheckOutput),
+      errors: { ...unavailable, ...notApplicable },
+    },
+    /**
+     * Splits a pending shell request into its commands and reports which ones still need approval, so a client can
+     * show and save only those. `not_applicable` when the request is gone, is not a shell request, or only a person
+     * may answer it; the client then shows its normal prompt.
+     */
+    inspect: {
+      input: portable(Schema.Struct({ requestID: Permission.ID })),
+      output: portable(InspectOutput),
+      errors: { ...unavailable, ...notApplicable },
+    },
+    /**
+     * "Always allow" for only the commands that need approval: saves `rules` as project grants and allows the
+     * request, then the other waiting requests the rules now cover. Each rule must be the `rule` or `exact` of a part
+     * that needs approval.
+     */
+    approve: {
+      input: portable(Schema.Struct({ requestID: Permission.ID, rules: Schema.Array(Schema.String) })),
+      output: portable(Empty),
       errors: { ...unavailable, ...notApplicable },
     },
   },

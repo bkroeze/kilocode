@@ -27,6 +27,7 @@ import { Mcp } from "@opencode/core/mcp/index"
 import { Automation } from "@opencode/core/automation"
 import { SdkPlugins } from "@opencode/core/plugin/sdk"
 import { Plugin } from "@opencode/core/plugin"
+import { PermissionSaved } from "@opencode/core/permission/saved"
 import { Session } from "@opencode/core/session"
 import { SessionRunnerModel } from "@opencode/core/session/runner/model"
 import { SessionProjector } from "@opencode/core/session/projector"
@@ -59,7 +60,8 @@ export const activations = new Map<string, number>()
 
 // The server's SdkPlugins store with the Kilo plugins registered, the seam upstream offers to embedders. The
 // plugin loader gives a registered plugin only its Scope, so the host provides the global services that a Kilo
-// plugin requires: the Gateway publishes on the global Bus, the agents read the Global paths. They are the
+// plugin requires: the Gateway publishes on the global Bus, the agents read the Global paths, the permissions plugin
+// saves narrowed approvals as project grants. They are the
 // services of the server's own graph.
 const plugins = makeGlobalNode({
   service: SdkPlugins.Service,
@@ -76,6 +78,7 @@ const plugins = makeGlobalNode({
         KiloRemote.Service,
         BrowserHub.Service,
         SessionStore.Service,
+        PermissionSaved.Service,
       )(
         yield* Effect.context<
           | Bus.Service
@@ -87,6 +90,7 @@ const plugins = makeGlobalNode({
           | KiloRemote.Service
           | BrowserHub.Service
           | SessionStore.Service
+          | PermissionSaved.Service
         >(),
       )
       const register = (
@@ -100,6 +104,7 @@ const plugins = makeGlobalNode({
           | KiloRemote.Service
           | BrowserHub.Service
           | SessionStore.Service
+          | PermissionSaved.Service
           | Scope.Scope
         >,
         phase?: "post",
@@ -132,6 +137,7 @@ const plugins = makeGlobalNode({
     Remote.node,
     KiloBrowserHub.node,
     SessionStore.node,
+    PermissionSaved.node,
   ],
 })
 

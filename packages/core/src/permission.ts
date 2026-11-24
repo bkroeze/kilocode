@@ -116,7 +116,14 @@ export interface Interface {
   /** True only when the rules already allow the request; never asks the user. */
   readonly allows: (input: AssertInput) => Effect.Effect<boolean, SessionErrors.NotFoundError>
   readonly reply: (input: ReplyInput) => Effect.Effect<void, NotFoundError>
-  readonly get: (id: ID) => Effect.Effect<Request | undefined>
+  // kilocode_change start - permission seam: opt-in pending requester access; default get remains public
+  readonly get: {
+    (id: ID): Effect.Effect<Request | undefined>
+    (id: ID, options: { readonly includeAgent: true }): Effect.Effect<
+      (Request & { readonly agent?: Agent.ID }) | undefined
+    >
+  }
+  // kilocode_change end
   readonly forSession: (sessionID: SessionSchema.ID) => Effect.Effect<ReadonlyArray<Request>>
   readonly list: () => Effect.Effect<ReadonlyArray<Request>>
   /**
@@ -389,9 +396,14 @@ const layer = Layer.effect(
       return Array.from(pending.values(), (item) => item.request)
     })
 
-    const get = Effect.fn("Permission.get")(function* (id: ID) {
-      return pending.get(id)?.request
+    // kilocode_change start - permission seam: opt-in pending requester access; default get remains public
+    const get = Effect.fn("Permission.get")(function* (id: ID, options?: { readonly includeAgent?: boolean }) {
+      const item = pending.get(id)
+      if (!item) return undefined
+      if (options?.includeAgent) return { ...item.request, agent: item.agent }
+      return item.request
     })
+    // kilocode_change end
 
     const forSession = Effect.fn("Permission.forSession")(function* (sessionID: SessionSchema.ID) {
       return Array.from(pending.values(), (item) => item.request).filter((request) => request.sessionID === sessionID)

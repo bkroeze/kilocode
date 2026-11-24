@@ -35,6 +35,9 @@ writeFileSync(
 )
 writeFileSync(path.join(root, "tsconfig.json"), "{}")
 
+const sessionID = Session.ID.make("ses_permission_sets")
+const projectID = Project.ID.make("prj_permission_sets")
+
 const it = testEffect(
   AppNodeBuilder.build(
     LayerNode.group([
@@ -48,12 +51,20 @@ const it = testEffect(
       Rpc.node,
       Permission.node,
     ]),
-    [Location.node.replace(Layer.succeed(Location.Service, Location.Service.of(location({ directory: root }))))],
+    // Core saves grants for the Location's project, so it is the project the plugin is installed for.
+    [
+      Location.node.replace(
+        Layer.succeed(
+          Location.Service,
+          Location.Service.of({
+            ...location({ directory: root }),
+            project: { id: projectID, directory: root, canonical: root },
+          }),
+        ),
+      ),
+    ],
   ),
 )
-
-const sessionID = Session.ID.make("ses_permission_sets")
-const projectID = Project.ID.make("prj_permission_sets")
 
 function setup(
   input: {
@@ -67,7 +78,10 @@ function setup(
     const { db } = yield* Database.Service
     yield* db
       .insert(ProjectTable)
-      .values({ id: Project.ID.global, worktree: root, sandboxes: [] })
+      .values([
+        { id: Project.ID.global, worktree: root, sandboxes: [] },
+        { id: projectID, worktree: root, sandboxes: [] },
+      ])
       .onConflictDoNothing()
       .run()
       .pipe(Effect.orDie)
@@ -117,9 +131,38 @@ function setup(
     }
   })
 }
+function setAgentRules(id: Agent.ID, rules: Permission.Ruleset) {
+  return Effect.gen(function* () {
+    const agents = yield* Agent.Service
+    yield* agents.transform((editor) =>
+      editor.update(id, (agent) => {
+        agent.permissions = [...rules]
+      }),
+    )
+  })
+}
 
 function shell(resources: string[], input: Partial<Permission.AssertInput> = {}): Permission.AssertInput {
   return { sessionID, action: "shell", resources, ...input }
+}
+
+// Starts a shell request as the shell tool makes it and waits until it is pending.
+function waiting(resources: string[], save: string[], input: Partial<Permission.AssertInput> = {}) {
+  return Effect.gen(function* () {
+    const permission = yield* Permission.Service
+    const bus = yield* Bus.Service
+    const id = Permission.ID.create()
+    const asked = yield* Deferred.make<void>()
+    const unsubscribe = yield* bus.listen((event) =>
+      event.type === Permission.Event.Asked.type && (event.data as Permission.Request).id === id
+        ? Deferred.succeed(asked, undefined).pipe(Effect.asVoid)
+        : Effect.void,
+    )
+    yield* Effect.addFinalizer(() => unsubscribe)
+    const fiber = yield* permission.assert(shell(resources, { id, save, ...input })).pipe(Effect.forkScoped)
+    yield* Deferred.await(asked)
+    return { id, fiber }
+  })
 }
 
 describe("KiloPermissionsPlugin", () => {
@@ -354,6 +397,210 @@ describe("KiloPermissionsPlugin", () => {
     ),
   )
 
+  it.effect("reports which commands of a request need approval and saves only the chosen rule for them", () =>
+    Effect.gen(function* () {
+      // `foo this` is allowed exactly; saving the tool's `foo *` would widen that grant.
+      const { call } = yield* setup({ rules: [{ action: "shell", resource: "foo this", effect: "allow" }] })
+      const saved = yield* PermissionSaved.Service
+      const permission = yield* Permission.Service
+      const request = yield* waiting(["foo this", "bar that"], ["foo *", "bar *"])
+
+      const inspected = yield* call("inspect", { requestID: request.id })
+      expect(inspected).toMatchObject({
+        parts: [
+          { resource: "foo this", rule: "foo *", allowed: true },
+          { resource: "bar that", rule: "bar *", allowed: false },
+        ],
+      })
+      if (process.platform === "win32") {
+        const parts = (inspected as { readonly parts: ReadonlyArray<Record<string, unknown>> }).parts
+        expect(parts[0]).not.toHaveProperty("exact")
+        expect(parts[1]).not.toHaveProperty("exact")
+      } else {
+        expect(inspected).toMatchObject({
+          parts: [
+            { exact: "foo this" },
+            { exact: "bar that" },
+          ],
+        })
+      }
+
+      const selected = process.platform === "win32" ? "bar *" : "bar that"
+      yield* call("approve", { requestID: request.id, rules: [selected] })
+      yield* Fiber.join(request.fiber)
+      expect(yield* permission.list()).toEqual([])
+      expect((yield* saved.list()).map((item) => [item.action, item.resource])).toEqual([["shell", selected]])
+      expect(yield* permission.ask(shell(["bar that"]))).toMatchObject({ effect: "allow" })
+      expect(yield* permission.ask(shell(["bar other"]))).toMatchObject({
+        effect: process.platform === "win32" ? "allow" : "ask",
+      })
+    }),
+  )
+  it.effect("saves a narrowed grant using the pending request agent", () =>
+    Effect.gen(function* () {
+      const { call } = yield* setup({ rules: [{ action: "shell", resource: "bun run test", effect: "allow" }] })
+      const saved = yield* PermissionSaved.Service
+      const permission = yield* Permission.Service
+      const requester = Agent.ID.make("requester")
+      yield* setAgentRules(requester, [])
+      const request = yield* waiting(["bun run test"], ["bun run *"], { agent: requester })
+
+      const inspected = yield* call("inspect", { requestID: request.id })
+      expect(inspected).toMatchObject({
+        parts: [{ resource: "bun run test", rule: "bun run *", allowed: false }],
+      })
+      if (process.platform === "win32") {
+        const parts =
+          inspected && typeof inspected === "object" && "parts" in inspected && Array.isArray(inspected.parts)
+            ? inspected.parts
+            : []
+        expect(parts).toHaveLength(1)
+        expect(parts[0]).not.toHaveProperty("exact")
+      }
+      const selected = process.platform === "win32" ? "bun run *" : "bun run test"
+      yield* call("approve", { requestID: request.id, rules: [selected] })
+      yield* Fiber.join(request.fiber)
+
+      expect((yield* saved.list()).map((item) => item.resource)).toEqual([selected])
+      expect(yield* permission.ask(shell(["bun run test"], { agent: requester }))).toMatchObject({ effect: "allow" })
+    }),
+  )
+
+  it.effect("inspects a pending request with its agent instead of the current session agent", () =>
+    Effect.gen(function* () {
+      const { call } = yield* setup()
+      const requester = Agent.ID.make("requester")
+      yield* setAgentRules(requester, [])
+      const request = yield* waiting(["bun run test"], ["bun run *"], { agent: requester })
+      yield* setAgentRules(requester, [{ action: "shell", resource: "bun run test", effect: "allow" }])
+
+      expect(yield* call("inspect", { requestID: request.id })).toMatchObject({
+        parts: [{ resource: "bun run test", rule: "bun run *", allowed: true }],
+      })
+      yield* call("approve", { requestID: request.id, rules: [] })
+      yield* Fiber.join(request.fiber)
+    }),
+  )
+
+  it.effect("does not offer exact grants when separator normalization collides", () =>
+    Effect.gen(function* () {
+      const { call } = yield* setup()
+      const saved = yield* PermissionSaved.Service
+      const permission = yield* Permission.Service
+      const resources = ["bun run src/index.ts", "bun run src\\index.ts"]
+      const request = yield* waiting(resources, ["bun run *", "bun run *"])
+
+      const inspected = yield* call("inspect", { requestID: request.id })
+      expect(inspected).toMatchObject({
+        parts: [
+          { resource: resources[0], rule: "bun run *", allowed: false },
+          { resource: resources[1], rule: "bun run *", allowed: false },
+        ],
+      })
+      const parts =
+        inspected && typeof inspected === "object" && "parts" in inspected && Array.isArray(inspected.parts)
+          ? inspected.parts
+          : []
+      expect(parts).toHaveLength(2)
+      for (const part of parts) expect(part).not.toHaveProperty("exact")
+
+      for (const resource of resources) {
+        const failed = yield* call("approve", { requestID: request.id, rules: [resource] }).pipe(Effect.flip)
+        expect(failed).toMatchObject({ type: "not_applicable" })
+      }
+      expect(yield* saved.list()).toEqual([])
+      for (const resource of resources)
+        expect(yield* permission.ask(shell([resource]))).toMatchObject({ effect: "ask" })
+    }),
+  )
+
+  it.effect("treats commands a permission set covers as allowed and never saves rules for them", () =>
+    Effect.gen(function* () {
+      const { call } = yield* setup()
+      yield* call("apply", { presetID: "typescript-checks" })
+      const saved = yield* PermissionSaved.Service
+      const request = yield* waiting(["bun run test", "git push origin"], ["bun run test *", "git push *"])
+
+      expect(yield* call("inspect", { requestID: request.id })).toMatchObject({
+        parts: [
+          { resource: "bun run test", allowed: true },
+          { resource: "git push origin", rule: "git push *", allowed: false },
+        ],
+      })
+      yield* call("approve", { requestID: request.id, rules: ["git push *"] })
+      yield* Fiber.join(request.fiber)
+      expect((yield* saved.list()).map((item) => item.resource)).toEqual(["git push *"])
+    }),
+  )
+
+  it.effect("refuses rules that were not offered for a command needing approval and changes nothing", () =>
+    Effect.gen(function* () {
+      const { call } = yield* setup({ rules: [{ action: "shell", resource: "foo this", effect: "allow" }] })
+      const saved = yield* PermissionSaved.Service
+      const permission = yield* Permission.Service
+      const request = yield* waiting(["foo this", "bar that"], ["foo *", "bar *"])
+      for (const rules of [["foo *"], ["bar that", "rm *"]]) {
+        const failed = yield* call("approve", { requestID: request.id, rules }).pipe(Effect.flip)
+        expect(failed).toMatchObject({ type: "not_applicable" })
+      }
+      expect((yield* permission.list()).map((item) => item.id)).toEqual([request.id])
+      expect(yield* saved.list()).toEqual([])
+    }),
+  )
+
+  it.effect("saves without raising another prompt and settles only the waiting requests the rules cover", () =>
+    Effect.gen(function* () {
+      const { call } = yield* setup()
+      const saved = yield* PermissionSaved.Service
+      const permission = yield* Permission.Service
+      const bus = yield* Bus.Service
+      const request = yield* waiting(["foo this", "bar that"], ["foo *", "bar *"])
+      const covered = yield* waiting(["bar other"], ["bar *"])
+      const uncovered = yield* waiting(["baz this"], ["baz *"])
+      // Listeners run inside publish, so every prompt `approve` raised would be recorded by the time it returns.
+      const asked: unknown[] = []
+      const unsubscribe = yield* bus.listen((event) =>
+        Effect.sync(() => {
+          if (event.type === Permission.Event.Asked.type) asked.push(event.data)
+        }),
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      yield* call("approve", { requestID: request.id, rules: ["foo *", "bar *"] })
+      yield* Fiber.join(request.fiber)
+      yield* Fiber.join(covered.fiber)
+      expect(asked).toEqual([])
+      expect((yield* permission.list()).map((item) => item.id)).toEqual([uncovered.id])
+      expect((yield* saved.list()).map((item) => item.resource).sort()).toEqual(["bar *", "foo *"])
+    }),
+  )
+
+  it.effect("approves once without saving when no rule is chosen, and offers no exact rule for a wildcard", () =>
+    Effect.gen(function* () {
+      const { call } = yield* setup()
+      const saved = yield* PermissionSaved.Service
+      const request = yield* waiting(["rm *.log"], ["rm *"])
+      expect(yield* call("inspect", { requestID: request.id })).toEqual({
+        parts: [{ resource: "rm *.log", rule: "rm *", allowed: false }],
+      })
+      yield* call("approve", { requestID: request.id, rules: [] })
+      yield* Fiber.join(request.fiber)
+      expect(yield* saved.list()).toEqual([])
+    }),
+  )
+
+  it.effect("does not narrow requests for a person or a non-shell action", () =>
+    Effect.gen(function* () {
+      const { call } = yield* setup()
+      const interactive = yield* waiting(["git push"], ["git push *"], { metadata: { interactive: true } })
+      const read = yield* waiting(["src/index.ts"], ["*"], { action: "read" })
+      for (const id of [interactive.id, read.id, Permission.ID.create()]) {
+        const failed = yield* call("inspect", { requestID: id }).pipe(Effect.flip)
+        expect(failed).toMatchObject({ type: "not_applicable" })
+      }
+    }),
+  )
+
   it.effect("ignores applied sets and refuses changes while the flag is off", () =>
     Effect.gen(function* () {
       const store = new Map<string, Schema.Json>([
@@ -367,6 +614,14 @@ describe("KiloPermissionsPlugin", () => {
       expect(failed).toMatchObject({ type: "unavailable" })
       expect(yield* call("reset", { all: true }).pipe(Effect.flip)).toMatchObject({ type: "unavailable" })
       expect(store.has(`applied:${projectID}`)).toBe(true)
+      const request = yield* waiting(["bun run test"], ["bun run test *"])
+      for (const [method, body] of [
+        ["inspect", { requestID: request.id }],
+        ["approve", { requestID: request.id, rules: [] }],
+      ] as const) {
+        const refused = yield* call(method, body).pipe(Effect.flip)
+        expect(refused).toMatchObject({ type: "unavailable" })
+      }
     }),
   )
 })

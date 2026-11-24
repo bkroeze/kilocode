@@ -2,15 +2,18 @@
 // rules with their set and allows a shell ask that they cover through the permission evaluate hook. Applied sets are
 // plugin state, not saved permission grants: resetting them never touches the user's own approvals. The hook only
 // turns `ask` into `allow`, so configured denies still win, and the hardening hooks registered after this plugin
-// (Flow, Browser, Agent Manager, managed Policy, Sandbox) still decide last.
+// (Flow, Browser, Agent Manager, managed Policy, Sandbox) still decide last. The same RPC narrows shell approvals to
+// the commands that still need one (see `narrow.ts`).
 import { Flag } from "@opencode/core/flag"
 import { Permission } from "@opencode/core/permission"
+import { PermissionSaved } from "@opencode/core/permission/saved"
 import { define, type Context } from "@opencode/plugin/effect/plugin"
 import { KiloPermission } from "@opencode/schema/kilocode/permission"
 import { KiloPermissionsRpc } from "@opencode/schema/kilocode/permissions"
 import { Project } from "@opencode/schema/project"
 import { FSUtil } from "@opencode/util/fs-util"
 import { Effect, Option, Schema, type Scope } from "effect"
+import { approve, inspect } from "./narrow"
 import { catalog } from "./presets"
 import { allowsRequest, covers, missing } from "./rules"
 
@@ -32,6 +35,7 @@ export const installPermissionSets = Effect.fn("KiloPermissionsPlugin")(function
     ? yield* Flag.enabled("permission_setup").pipe(Effect.provideService(Flag.Service, flags.value))
     : false
   const permission = yield* Effect.serviceOption(Permission.Service)
+  const saved = yield* PermissionSaved.Service
   const projectID = ctx.location.project.id
   // Every repository without a remote or a commit shares the global project, so state keyed by it would carry one
   // repository's sets into another. Sets stay off there until the repository has an identity of its own.
@@ -61,9 +65,9 @@ export const installPermissionSets = Effect.fn("KiloPermissionsPlugin")(function
         )
 
   // Settles the waiting requests the applied sets now cover, as if the user had answered each one once. A pending
-  // request does not carry the agent that asked, so `allows` evaluates the session's current agent, whose rules may be
-  // wider. A request settles only when the sets alone cover every resource; `allows` still applies configured denies,
-  // saved rules and the later hardening hooks.
+  // request does not carry the agent that asked, so `allows` evaluates the session's current agent, whose rules may
+  // be wider. A request settles only when the sets alone cover every resource; `allows` still applies configured
+  // denies, saved rules and the later hardening hooks.
   const drain = Effect.gen(function* () {
     if (Option.isNone(permission)) return
     const rules = (yield* applied()).flatMap((set) => set.resources)
@@ -193,12 +197,36 @@ export const installPermissionSets = Effect.fn("KiloPermissionsPlugin")(function
           )
           return { presetID: selected.id, results }
         }),
+      inspect: (input, context) =>
+        Effect.gen(function* () {
+          if (!enabled || Option.isNone(permission))
+            return yield* Effect.fail(context.error("unavailable", "Permission setup is disabled"))
+          const parts = yield* inspect(permission.value, input.requestID)
+          if (parts === undefined)
+            return yield* Effect.fail(context.error("not_applicable", "The request cannot be narrowed"))
+          return { parts }
+        }),
+      approve: (input, context) =>
+        Effect.gen(function* () {
+          if (!enabled || Option.isNone(permission))
+            return yield* Effect.fail(context.error("unavailable", "Permission setup is disabled"))
+          const result = yield* approve(
+            { permission: permission.value, saved, projectID },
+            input.requestID,
+            input.rules,
+          )
+          if (result === "missing")
+            return yield* Effect.fail(context.error("not_applicable", "The request cannot be narrowed"))
+          if (result === "invalid")
+            return yield* Effect.fail(context.error("not_applicable", "The rules no longer match the request"))
+          return {}
+        }),
     })
     .pipe(Effect.orDie)
   events.emit = (sets) => registration.events.emit("updated", { projectID, applied: sets }).pipe(Effect.ignore)
 })
 
-export const KiloPermissionsPlugin = define<FSUtil.Service | Scope.Scope>({
+export const KiloPermissionsPlugin = define<FSUtil.Service | PermissionSaved.Service | Scope.Scope>({
   id: "kilocode.permissions",
   effect: (ctx) => installPermissionSets(ctx),
 })

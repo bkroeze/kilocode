@@ -892,3 +892,344 @@ test("a repository without its own project identity gets no offer, and /permissi
   await openManualChooser(app, "This repository has no commit or remote yet")
   expect(manual.applied).toEqual([])
 })
+
+// A shell call whose first command is already allowed: the prompt marks only the second, and "Always allow" saves
+// only the rule chosen for it.
+type NarrowPart = {
+  readonly resource: string
+  readonly rule: string
+  readonly exact?: string
+  readonly allowed: boolean
+}
+
+type NarrowState = State & {
+  approved?: string[]
+  withSource: boolean
+  inspectCalls: number
+  readonly replies: unknown[]
+  readonly approveFailure?: boolean
+}
+
+function narrowState(overrides: Partial<NarrowState> = {}): NarrowState {
+  return { ...state({ decision: "accepted" }), withSource: true, inspectCalls: 0, replies: [], ...overrides }
+}
+
+function narrowFetch(
+  current: NarrowState,
+  options: {
+    readonly command?: string
+    readonly parts?: readonly NarrowPart[]
+    readonly action?: string
+    readonly parentID?: string
+  } = {},
+) {
+  const base = fixtureFetch(current, { parentID: options.parentID })
+  const parts = options.parts ?? [
+    { resource: "foo this", rule: "foo *", exact: "foo this", allowed: true },
+    { resource: "bar that", rule: "bar *", exact: "bar that", allowed: false },
+  ]
+  const command = options.command ?? "foo this && bar that"
+  const request = {
+    id: requestID,
+    sessionID,
+    action: options.action ?? "shell",
+    resources: parts.map((part) => part.resource),
+    save: parts.map((part) => part.rule),
+    ...(current.withSource ? { source: { type: "tool" as const, messageID: "msg_shell", id: "tool_shell" } } : {}),
+  }
+  return async (url: URL, input: Request) => {
+    if (url.pathname === `/api/session/${sessionID}/permission`) return json({ data: current.pending ? [request] : [] })
+    if (url.pathname === `/api/session/${sessionID}/message`)
+      return json({
+        data: [
+          {
+            type: "assistant",
+            id: "msg_shell",
+            agent: "build",
+            model: { providerID: "demo", id: "model" },
+            content: [
+              {
+                type: "tool",
+                id: "tool_shell",
+                name: "shell",
+                state: { status: "running", input: { command } },
+                time: { created: 1 },
+              },
+            ],
+            time: { created: 1 },
+          },
+        ],
+        cursor: {},
+      })
+    if (url.pathname.endsWith("/kilocode.permissions/inspect")) {
+      current.inspectCalls += 1
+      return json({ output: { parts } })
+    }
+    if (url.pathname.endsWith("/kilocode.permissions/approve")) {
+      const body = (await input.json()) as { input: { rules: string[] } }
+      current.approved = body.input.rules
+      if (current.approveFailure) return new Response("not applicable", { status: 500 })
+      current.pending = false
+      return json({ output: {} })
+    }
+    if (/\/permission\/[^/]+\/reply$/.test(url.pathname)) current.replies.push(await input.clone().json())
+    return base(url, input)
+  }
+}
+
+test("highlights only the commands that need approval and saves only the rule chosen for them", async () => {
+  const current = narrowState()
+  await using app = await createAppFixture({
+    width: 100,
+    height: 34,
+    args: { sessionID },
+    config: { animations: false, tabs: { mode: "off" } },
+    fetch: narrowFetch(current),
+  })
+  await app.ready
+  const prompt = await until(app, "narrowed prompt", (frame) => frame.includes("Only the highlighted commands"))
+  expect(prompt).toContain("$ foo this && bar that")
+
+  app.mockInput.pressKey("l")
+  const always = await until(app, "always preview", (frame) => frame.includes("Next, choose the rules"))
+  expect(always).toContain("- bar *")
+  expect(always).not.toContain("- foo *")
+
+  app.mockInput.pressEnter()
+  const rules = await until(app, "rule chooser", (frame) => frame.includes("Always allow for this project"))
+  expect(rules).toContain("› (•) bar *")
+  expect(rules).toContain("( ) bar that")
+  expect(rules).toContain("foo this")
+  expect(rules).not.toContain("foo *")
+  app.mockInput.pressKey(" ")
+  await until(app, "exact rule chosen", (frame) => frame.includes("(•) bar that"))
+  app.mockInput.pressEnter()
+  await until(app, "approve call", () => current.approved !== undefined)
+  expect(current.approved).toEqual(["bar that"])
+  expect(current.replyCalls).toBe(0)
+  // The prompt mounts once the project check finishes, so the request is inspected once.
+  expect(current.inspectCalls).toBe(1)
+})
+test("keeps exact grants distinct when commands share a broad rule", async () => {
+  const current = narrowState()
+  const parts = [
+    { resource: "git push origin", rule: "git push *", exact: "git push origin", allowed: false },
+    { resource: "git push backup", rule: "git push *", exact: "git push backup", allowed: false },
+  ]
+  await using app = await createAppFixture({
+    width: 100,
+    height: 34,
+    args: { sessionID },
+    config: { animations: false, tabs: { mode: "off" } },
+    fetch: narrowFetch(current, { command: parts.map((part) => part.resource).join(" && "), parts }),
+  })
+  await app.ready
+  await until(app, "narrowed prompt", (frame) => frame.includes("Only the highlighted commands"))
+  app.mockInput.pressKey("l")
+  await until(app, "always preview", (frame) => frame.includes("Next, choose the rules"))
+  app.mockInput.pressEnter()
+  await until(app, "rule chooser", (frame) => frame.includes("Always allow for this project"))
+  app.mockInput.pressKey(" ")
+  app.mockInput.pressArrow("down")
+  await until(app, "second command focused", (frame) =>
+    frame.split("\n").some((line) => line.includes("› (•) git push *") && line.includes("( ) git push backup")),
+  )
+  app.mockInput.pressKey(" ")
+  await until(app, "both exact grants chosen", (frame) => frame.includes("(•) git push backup"))
+  app.mockInput.pressEnter()
+  await until(app, "approve call", () => current.approved !== undefined)
+  expect(current.approved).toEqual(["git push origin", "git push backup"])
+})
+
+test("scrolls to and saves an offscreen exact choice", async () => {
+  const current = narrowState()
+  const needed = Array.from({ length: 12 }, (_, index) => {
+    const name = `tool-${index + 1}`
+    return { resource: `${name} value`, rule: `${name} *`, exact: `${name} value`, allowed: false }
+  })
+  const allowed = Array.from({ length: 12 }, (_, index) => {
+    const name = `already-${index + 1}`
+    return { resource: `${name} value`, rule: `${name} *`, allowed: true }
+  })
+  const parts = [...needed, ...allowed]
+  await using app = await createAppFixture({
+    width: 70,
+    height: 34,
+    args: { sessionID },
+    config: { animations: false, tabs: { mode: "off" } },
+    fetch: narrowFetch(current, { command: parts.map((part) => part.resource).join(" && "), parts }),
+  })
+  await app.ready
+  await until(app, "narrowed prompt", (frame) => frame.includes("Only the highlighted commands"))
+  app.mockInput.pressKey("l")
+  await until(app, "always preview rule", (frame) => frame.includes("- tool-"))
+  app.mockInput.pressEnter()
+  const initial = await until(app, "rule chooser", (frame) => frame.includes("Always allow for this project"))
+  expect(initial).not.toContain("tool-12 *")
+  for (let index = 0; index < 11; index++) app.mockInput.pressArrow("down")
+  await until(app, "offscreen rule", (frame) => frame.includes("› (•) tool-12 *"))
+  app.mockInput.pressKey("f", { ctrl: true })
+  await until(
+    app,
+    "fullscreen last row",
+    (frame) => frame.includes("minimize") && frame.includes("› (•) tool-12 *"),
+  )
+  app.mockInput.pressKey("f", { ctrl: true })
+  await until(
+    app,
+    "minimized last row",
+    (frame) => frame.includes("fullscreen") && frame.includes("› (•) tool-12 *"),
+  )
+  app.mockInput.pressKey(" ")
+  await until(app, "offscreen exact choice", (frame) => frame.includes("(•) tool-12 value"))
+  app.mockInput.pressEnter()
+  await until(app, "approve call", () => current.approved !== undefined)
+  expect(current.approved).toEqual([...needed.slice(0, -1).map((part) => part.rule), "tool-12 value"])
+})
+
+test("uses the status list when a normalized command resource has an ambiguous source", async () => {
+  const current = narrowState()
+  const parts = [{ resource: "git push origin", rule: "git push *", exact: "git push origin", allowed: false }]
+  await using app = await createAppFixture({
+    width: 100,
+    height: 34,
+    args: { sessionID },
+    config: { animations: false, tabs: { mode: "off" } },
+    fetch: narrowFetch(current, { command: 'cd "git push origin" && git push origin', parts }),
+  })
+  await app.ready
+  const prompt = await until(app, "status list", (frame) => frame.includes("△ git push origin"))
+  expect(prompt).not.toContain('$ cd "git push origin" && git push origin')
+})
+
+test("lists the commands with their status when the command text is not at hand", async () => {
+  const current = narrowState({ withSource: false })
+  await using app = await createAppFixture({
+    width: 100,
+    height: 34,
+    args: { sessionID },
+    config: { animations: false, tabs: { mode: "off" } },
+    fetch: narrowFetch(current),
+  })
+  await app.ready
+  const prompt = await until(app, "narrowed list", (frame) => frame.includes("Only the highlighted commands"))
+  expect(prompt).toContain("✓ foo this")
+  expect(prompt).toContain("△ bar that")
+  app.mockInput.pressEnter()
+  await until(app, "once reply", () => current.replyCalls > 0)
+  expect(current.approved).toBeUndefined()
+})
+
+// Polls like `until`, and records whether any frame on the way showed `text`.
+async function untilWithout(
+  app: { captureCharFrame: () => string },
+  label: string,
+  predicate: (frame: string) => boolean,
+  text: string,
+) {
+  let seen = false
+  const frame = await until(app, label, (value) => {
+    seen ||= value.includes(text)
+    return predicate(value)
+  })
+  return { frame, seen }
+}
+
+test("shows the normal prompt for other actions without inspecting the request", async () => {
+  const current = narrowState()
+  await using app = await createAppFixture({
+    width: 100,
+    height: 34,
+    args: { sessionID },
+    config: { animations: false, tabs: { mode: "off" } },
+    fetch: narrowFetch(current, { action: "read" }),
+  })
+  await app.ready
+  const result = await untilWithout(
+    app,
+    "normal prompt",
+    (frame) => frame.includes("Permission required"),
+    "Checking which commands need approval",
+  )
+  expect(result.seen).toBe(false)
+  expect(result.frame).not.toContain("Only the highlighted commands")
+  expect(current.inspectCalls).toBe(0)
+})
+
+test("shows the normal prompt without inspecting while permission setup is off", async () => {
+  const current = narrowState({ enabled: false })
+  await using app = await createAppFixture({
+    width: 100,
+    height: 34,
+    args: { sessionID },
+    config: { animations: false, tabs: { mode: "off" } },
+    fetch: narrowFetch(current),
+  })
+  await app.ready
+  const result = await untilWithout(
+    app,
+    "normal prompt",
+    (frame) => frame.includes("Permission required"),
+    "Checking which commands need approval",
+  )
+  expect(result.seen).toBe(false)
+  expect(result.frame).not.toContain("Only the highlighted commands")
+  expect(current.inspectCalls).toBe(0)
+})
+
+test("falls back to the normal prompt when saving the rules fails, and the request can still be answered", async () => {
+  const current = narrowState({ approveFailure: true })
+  await using app = await createAppFixture({
+    width: 100,
+    height: 34,
+    args: { sessionID },
+    config: { animations: false, tabs: { mode: "off" } },
+    fetch: narrowFetch(current),
+  })
+  await app.ready
+  await until(app, "narrowed prompt", (frame) => frame.includes("Only the highlighted commands"))
+  app.mockInput.pressKey("l")
+  await until(app, "always preview", (frame) => frame.includes("Next, choose the rules"))
+  app.mockInput.pressEnter()
+  await until(app, "rule chooser", (frame) => frame.includes("Always allow for this project"))
+  app.mockInput.pressEnter()
+  await until(app, "save failure toast", (frame) => frame.includes("Could not save the rules"))
+  const normal = await until(
+    app,
+    "normal prompt",
+    (frame) => frame.includes("Permission required") && !frame.includes("Always allow for this project"),
+  )
+  expect(normal).not.toContain("Only the highlighted commands")
+  expect(current.approved).toEqual(["bar *"])
+  expect(current.replyCalls).toBe(0)
+  app.mockInput.pressEnter()
+  await until(app, "once reply", () => current.replyCalls > 0)
+  expect(current.replies).toMatchObject([{ decision: "once" }])
+})
+
+test("a subagent's rejection asks for feedback, which can be cancelled, then sends it with the reply", async () => {
+  const current = narrowState()
+  await using app = await createAppFixture({
+    width: 100,
+    height: 34,
+    args: { sessionID },
+    config: { animations: false, tabs: { mode: "off" } },
+    fetch: narrowFetch(current, { parentID: "ses_parent" }),
+  })
+  await app.ready
+  await until(app, "narrowed prompt", (frame) => frame.includes("Only the highlighted commands"))
+  app.mockInput.pressEscape()
+  await until(app, "reject feedback", (frame) => frame.includes("Tell the agent what to do differently"))
+  app.mockInput.pressEscape()
+  await until(app, "back to the prompt", (frame) => frame.includes("Only the highlighted commands"))
+  expect(current.replyCalls).toBe(0)
+
+  app.mockInput.pressEscape()
+  await until(app, "reject feedback again", (frame) => frame.includes("Tell the agent what to do differently"))
+  await app.mockInput.typeText("run the tests first")
+  await until(app, "feedback typed", (frame) => frame.includes("run the tests first"))
+  app.mockInput.pressEnter()
+  await until(app, "reject reply", () => current.replyCalls > 0)
+  expect(current.replies).toMatchObject([{ decision: "reject", message: "run the tests first" }])
+  expect(current.approved).toBeUndefined()
+})

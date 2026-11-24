@@ -10,7 +10,8 @@ import { useTerminalDimensions } from "@opentui/solid"
 import { Keymap } from "../context/keymap"
 import { useTheme } from "../context/theme"
 import { DialogHeader, DialogLayout } from "../ui/dialog"
-import { PermissionPrompt, SessionQuestion } from "../routes/session/permission"
+import { SessionQuestion } from "../routes/session/permission"
+import { NarrowedPermission, PermissionStatus, resolveSessionLocation } from "./permission-narrow"
 
 type CopyKey = Extract<keyof typeof dict, `tui.permissions.${string}`>
 
@@ -34,7 +35,8 @@ type ControllerState =
       readonly location: LocationRef
       readonly action: Decision
     }
-  | { readonly status: "normal"; readonly projectID?: string }
+  // `enabled` is false once the server reports permission setup off, and unknown when the check failed.
+  | { readonly status: "normal"; readonly projectID?: string; readonly enabled?: boolean }
 
 type Decision = "update" | "skip" | "clear"
 
@@ -117,6 +119,7 @@ function definePlugin(): Plugin.Definition {
           onCleanup(() => lease[Symbol.dispose]())
           return (
             <PermissionGate
+              context={context}
               controller={lease.controller}
               request={input.request}
               directory={input.directory}
@@ -288,7 +291,7 @@ function createController(context: Plugin.Context, applied: Applied): Controller
       const result = await context.client.rpc(KiloPermissionsRpc.Definition).list({}, { location })
       if (generation !== loads) return undefined
       applied.remember(location.directory, result.projectID, !result.enabled || result.decision !== null)
-      const normal = { status: "normal", projectID: result.projectID } as const
+      const normal = { status: "normal", projectID: result.projectID, enabled: result.enabled } as const
       if (!result.enabled) {
         setState(normal)
         return manual ? "disabled" : undefined
@@ -417,9 +420,11 @@ function createController(context: Plugin.Context, applied: Applied): Controller
     },
     // Closing the manual chooser without a choice leaves the offer state behind; without this reset the next
     // `/permissions` sees an active offer and does nothing. Nothing was decided, so the next request checks again
-    // and still gets the automatic offer while the project has no decision.
+    // and still gets the automatic offer while the project has no decision. A prompt already on screen shows the
+    // normal approval; `idle` would leave it waiting for a check that never starts.
     dismiss() {
-      if (state().status === "offer") setState({ status: "idle" })
+      const current = state()
+      if (current.status === "offer") setState({ status: "normal", projectID: current.projectID, enabled: true })
     },
     async settled() {
       while (operation) await operation
@@ -436,13 +441,6 @@ function createController(context: Plugin.Context, applied: Applied): Controller
   }
 
   return api
-}
-
-async function resolveSessionLocation(context: Plugin.Context, sessionID: string): Promise<LocationRef | undefined> {
-  const current = context.data.session.get(sessionID)
-  if (current) return current.location
-  await context.data.session.sync(sessionID).catch(() => undefined)
-  return context.data.session.get(sessionID)?.location
 }
 
 async function openManual(context: Plugin.Context, getController: (key: string) => ControllerLease) {
@@ -721,6 +719,7 @@ function PresetDetails(props: { readonly presets: readonly Preset[] }) {
 }
 
 function PermissionGate(props: {
+  readonly context: Plugin.Context
   readonly controller: Controller
   readonly request: PermissionRequest
   readonly directory: string | undefined
@@ -735,9 +734,14 @@ function PermissionGate(props: {
     ),
   )
   const state = props.controller.state
+  const normal = () => {
+    const current = state()
+    return current.status === "normal" ? current : undefined
+  }
   return (
     <Switch>
-      <Match when={state().status === "checking"}>
+      {/* `idle` is the moment before the check starts; the narrowed prompt waits so it inspects only once. */}
+      <Match when={state().status === "checking" || state().status === "idle"}>
         <PermissionStatus message={t("tui.permissions.checking")} />
       </Match>
       <Match when={state().status === "submitting"}>
@@ -755,18 +759,14 @@ function PermissionGate(props: {
         </Show>
       </Match>
       <Match when={true}>
-        <PermissionPrompt request={props.request} directory={props.directory} />
+        <NarrowedPermission
+          context={props.context}
+          request={props.request}
+          directory={props.directory}
+          enabled={normal()?.enabled}
+        />
       </Match>
     </Switch>
-  )
-}
-
-function PermissionStatus(props: { readonly message: string }) {
-  const theme = useTheme()
-  return (
-    <box id="session.permission.status" paddingLeft={2} paddingTop={1} paddingBottom={1}>
-      <text fg={theme.text.muted}>{props.message}</text>
-    </box>
   )
 }
 

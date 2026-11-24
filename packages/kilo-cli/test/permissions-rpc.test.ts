@@ -274,6 +274,71 @@ test("reconciles a pending request only after every resource is granted", async 
   }
 })
 
+test("narrows a shell approval to the commands that need one and saves only their rules", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "kilo-permissions-narrow-"))
+  const database = path.join(root, "data", "permissions.sqlite")
+  await mkdir(path.dirname(database), { recursive: true })
+  const directory = await project(root, "kilo", true)
+  try {
+    await withServer({ database, directory: path.join(root, "config") }, async (client, ready) => {
+      await ready(directory)
+      const location = { directory }
+      const options = { location }
+      const rpc = client.rpc(rpcDefinition)
+      await rpc.apply({ presetID: "kilo-bun-checks" }, options)
+      const session = await client.session.create({ location, title: "Narrowed approval" })
+      const created = await client.permission.create({
+        sessionID: session.id,
+        action: "shell",
+        resources: ["bun run check", "git push origin", "git push backup"],
+        save: ["bun run check *", "git push *", "git push *"],
+      })
+      expect(created.effect).toBe("ask")
+      await eventually(
+        () => client.permission.request.list(options),
+        (result) => result.data.some((request) => request.id === created.id),
+      )
+
+      const inspected = await rpc.inspect({ requestID: created.id }, options)
+      expect(inspected).toMatchObject({
+        parts: [
+          { resource: "bun run check", rule: "bun run check *", allowed: true },
+          { resource: "git push origin", rule: "git push *", allowed: false },
+          { resource: "git push backup", rule: "git push *", allowed: false },
+        ],
+      })
+      expect(inspected.parts.map((part) => part.exact)).toEqual(
+        process.platform === "win32"
+          ? [undefined, undefined, undefined]
+          : ["bun run check", "git push origin", "git push backup"],
+      )
+      const rules = process.platform === "win32" ? ["git push *"] : ["git push origin", "git push backup"]
+      await rpc.approve({ requestID: created.id, rules }, options)
+      await eventually(
+        () => client.permission.request.list(options),
+        (result) => result.data.length === 0,
+      )
+      const saved = await client.permission.saved.list({ projectID: (await rpc.list({}, options)).projectID })
+      expect(saved.map((item) => item.resource).sort()).toEqual([...rules].sort())
+      expect(
+        (await client.permission.create({
+          sessionID: session.id,
+          action: "shell",
+          resources: ["git push origin", "git push backup"],
+        })).effect,
+      ).toBe("allow")
+      const other = await client.permission.create({
+        sessionID: session.id,
+        action: "shell",
+        resources: ["git push elsewhere"],
+      })
+      expect(other.effect).toBe(process.platform === "win32" ? "allow" : "ask")
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test("lists saved grants, then the active set and its grants", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "kilo-permissions-list-"))
   const database = path.join(root, "data", "permissions.sqlite")
