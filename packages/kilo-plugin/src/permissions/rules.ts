@@ -5,11 +5,13 @@ import { Effect } from "effect"
 import os from "os"
 import path from "path"
 
-// Redirections that write no file: descriptor duplication (`2>&1`, `>&2`) and discarding output to /dev/null.
-const harmless = /\d*>&\d+|(?:\d*|&)>>?\s*\/dev\/null(?![^\s;|&])/g
+// Redirections that write no file: descriptor duplication (`2>&1`, `>&2`) and discarding output to /dev/null. The
+// target must end there: `>&1abc` and `>&2/x` write a file.
+const harmless = /(?:\d*>&\d+|(?:\d*|&)>>?\s*\/dev\/null)(?![^\s;|&])/g
 
-// Any expansion could print a variable, run a command or name a path the set cannot check.
-const expansion = /`|\$/
+// Any expansion could print a variable, run a command or name a path the set cannot check. The scanner keeps a brace
+// list as one word, but the shell expands `{--prefix,/tmp/other}` into an option and its value.
+const expansion = /[`${}]/
 // Install subcommands a set allows only without a package argument, so they install from the lockfile. `add` always
 // names a package; it is listed so a set stored before `add` left the install set still asks.
 const installPattern = /^(?:bun|npm|pnpm|yarn) (?:install|i|ci|add) \*$/
@@ -50,6 +52,11 @@ const projectEscapeOptions = [
   "modules-folder",
   "store-dir",
   "virtual-store-dir",
+  // A debugger socket runs any code in the process.
+  "inspect",
+  "inspect-brk",
+  "inspect-wait",
+  "inspect-port",
 ]
 // Their short forms: -C (prefix/dir), -w (workspace), -g (global), -F (filter), -r (recursive/preload), -c (config),
 // -e and -p (eval/print).

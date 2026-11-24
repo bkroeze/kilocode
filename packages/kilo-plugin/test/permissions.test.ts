@@ -224,6 +224,9 @@ describe("permission setup catalog", () => {
       expect(effects(presetValue, "bun install >> ~/.bashrc")).toEqual(["ask"])
       expect(effects(presetValue, "bun run test &> out.log")).toEqual(["ask"])
       expect(effects(presetValue, "bun run test 2>/dev/nullx")).toEqual(["ask"])
+      expect(effects(presetValue, "bun run test >&1abc")).toEqual(["ask"])
+      expect(effects(presetValue, "bun run test >&2/hook")).toEqual(["ask"])
+      expect(effects(presetValue, "bun install 2>&1x")).toEqual(["ask"])
       expect(effects(presetValue, "bun run test <(cat secret)")).toEqual(["ask", "ask"])
       expect(effects(presetValue, "bun run test < .env")).toEqual(["ask"])
       expect(effects(presetValue, "bun run test <<< secret")).toEqual(["ask"])
@@ -255,6 +258,12 @@ describe("permission setup catalog", () => {
         `${manager} run test --config.script-shell=/tmp/evil`,
         `${manager} run test --preload /tmp/evil.ts`,
         `${manager} run test $EXTRA`,
+        `${manager} run test {--prefix,/tmp/other}`,
+        `${manager} run test {/tmp/a,/tmp/b}`,
+        `${manager} test {--preload,evil.ts}`,
+        `${manager} test --inspect`,
+        `${manager} test --inspect-brk`,
+        `${manager} test --inspect-wait=0.0.0.0:9229`,
         `${manager} test --prefix /tmp/other`,
       ]) {
         expect(effects(checks, command)).toEqual(["ask"])
@@ -263,6 +272,7 @@ describe("permission setup catalog", () => {
       expect(effects(install, `${manager} install --prefix /tmp/other`)).toEqual(["ask"])
       expect(effects(install, `${manager} install --registry=https://evil.example`)).toEqual(["ask"])
       expect(effects(install, `${manager} install --global`)).toEqual(["ask"])
+      expect(effects(install, `${manager} install {--prefix,/tmp/other}`)).toEqual(["ask"])
       expect(effects(checks, `${manager} run test -- --prefix /tmp/other`)).toEqual(["allow"])
       expect(effects(checks, `${manager} run test --watch=false`)).toEqual(["allow"])
       expect(effects(checks, `${manager} run lint --fix`)).toEqual(["allow"])

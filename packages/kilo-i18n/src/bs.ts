@@ -230,6 +230,11 @@ export const dict = {
   "tui.permissions.applied": "Primijenjeno",
   "tui.permissions.sidebar": "Skupovi dozvola",
   "tui.permissions.choose": "Gore/dolje: pomjeranje. Razmak: označite ili poništite skup dozvola. PageUp/PageDown: pomjerajte se kroz naredbe.",
+  "tui.permissions.key.previous": "Prethodni skup dozvola",
+  "tui.permissions.key.next": "Sljedeći skup dozvola",
+  "tui.permissions.key.toggle": "Označi skup dozvola ili poništi oznaku",
+  "tui.permissions.key.scrollUp": "Pomjeri naredbe prema gore",
+  "tui.permissions.key.scrollDown": "Pomjeri naredbe prema dolje",
   "tui.permissions.rules": "Shell naredbe dozvoljene ovim skupom",
   "tui.permissions.trust":
     "Projektne skripte mogu izvršavati kod iz repozitorija. Postojeća pravila zabrane i dalje važe.",

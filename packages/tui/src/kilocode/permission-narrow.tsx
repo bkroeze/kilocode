@@ -418,6 +418,18 @@ function RejectFeedback(props: {
     mode: "base",
     priority: 2,
     commands: [
+      {
+        // Ctrl+C clears typed feedback first, then cancels the rejection instead of exiting the app.
+        id: "app.exit",
+        title: t("tui.permissions.cancel"),
+        run(_input, event) {
+          if (event?.ctrl && event.name === "c" && input?.plainText) {
+            input.setText("")
+            return
+          }
+          props.onCancel()
+        },
+      },
       { bind: "escape", title: t("tui.permissions.cancel"), run: () => props.onCancel() },
       { bind: "return", title: t("tui.permissions.narrow.confirm"), run: () => props.onConfirm(input?.plainText ?? "") },
     ],

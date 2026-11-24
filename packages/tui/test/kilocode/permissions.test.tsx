@@ -1177,6 +1177,38 @@ test("shows the normal prompt without inspecting while permission setup is off",
   expect(current.inspectCalls).toBe(0)
 })
 
+test("does not inspect a later request of a project remembered with permission setup off", async () => {
+  const current = narrowState({ enabled: false })
+  await using app = await createAppFixture({
+    width: 100,
+    height: 34,
+    args: { sessionID },
+    config: { animations: false, tabs: { mode: "off" } },
+    fetch: narrowFetch(current),
+  })
+  await app.ready
+  await until(app, "normal prompt", (frame) => frame.includes("Permission required"))
+  current.pending = false
+  emitReplied(app)
+  await until(app, "prompt released", (frame) => frame.includes("ctrl+p commands"))
+
+  current.pending = true
+  app.events.emit({
+    id: "evt_second_request",
+    created: Date.now(),
+    type: "permission.asked",
+    data: permissionRequest(sessionID, "per_second"),
+  })
+  const result = await untilWithout(
+    app,
+    "second normal prompt",
+    (frame) => frame.includes("Permission required"),
+    "Checking which commands need approval",
+  )
+  expect(result.seen).toBe(false)
+  expect(current.inspectCalls).toBe(0)
+})
+
 test("falls back to the normal prompt when saving the rules fails, and the request can still be answered", async () => {
   const current = narrowState({ approveFailure: true })
   await using app = await createAppFixture({
@@ -1222,6 +1254,18 @@ test("a subagent's rejection asks for feedback, which can be cancelled, then sen
   await until(app, "reject feedback", (frame) => frame.includes("Tell the agent what to do differently"))
   app.mockInput.pressEscape()
   await until(app, "back to the prompt", (frame) => frame.includes("Only the highlighted commands"))
+  expect(current.replyCalls).toBe(0)
+
+  // Ctrl+C clears typed feedback, then cancels the rejection; it never exits the app.
+  app.mockInput.pressEscape()
+  await until(app, "reject feedback for ctrl+c", (frame) => frame.includes("Tell the agent what to do differently"))
+  await app.mockInput.typeText("never mind")
+  await until(app, "discarded feedback typed", (frame) => frame.includes("never mind"))
+  app.mockInput.pressKey("c", { ctrl: true })
+  await until(app, "feedback cleared", (frame) => !frame.includes("never mind"))
+  expect(app.captureCharFrame()).toContain("Tell the agent what to do differently")
+  app.mockInput.pressKey("c", { ctrl: true })
+  await until(app, "back to the prompt after ctrl+c", (frame) => frame.includes("Only the highlighted commands"))
   expect(current.replyCalls).toBe(0)
 
   app.mockInput.pressEscape()

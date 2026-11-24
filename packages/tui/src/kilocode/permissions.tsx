@@ -63,12 +63,12 @@ type ControllerLease = {
 }
 // Sets applied to each project, keyed by project ID; the sidebar shows them while any are applied. It also remembers
 // the projects that get no automatic offer (setup disabled, or a decision recorded), so their requests show the normal
-// prompt without another check.
+// prompt without another check, and whether setup is enabled there, so a shell request is narrowed only when it can be.
 type Applied = {
   readonly get: (projectID: string) => readonly Preset[]
   readonly refresh: (location: LocationRef) => Promise<string | undefined>
-  readonly quiet: (directory: string) => boolean
-  readonly remember: (directory: string, projectID: string, quiet: boolean) => void
+  readonly quiet: (directory: string) => { readonly enabled: boolean } | undefined
+  readonly remember: (directory: string, projectID: string, quiet: { readonly enabled: boolean } | undefined) => void
   readonly dispose: () => void
 }
 type Navigation = {
@@ -142,31 +142,31 @@ function definePlugin(): Plugin.Definition {
               {
                 id: "kilo.permissions.previous",
                 bind: "up,k",
-                title: "Previous permission set",
+                title: t("tui.permissions.key.previous"),
                 run: () => navigation()?.move(-1),
               },
               {
                 id: "kilo.permissions.next",
                 bind: "down,j",
-                title: "Next permission set",
+                title: t("tui.permissions.key.next"),
                 run: () => navigation()?.move(1),
               },
               {
                 id: "kilo.permissions.toggle",
                 bind: "space",
-                title: "Check or uncheck permission set",
+                title: t("tui.permissions.key.toggle"),
                 run: () => navigation()?.toggle(),
               },
               {
                 id: "kilo.permissions.pageup",
                 bind: "pageup",
-                title: "Scroll commands up",
+                title: t("tui.permissions.key.scrollUp"),
                 run: () => navigation()?.scroll(-1),
               },
               {
                 id: "kilo.permissions.pagedown",
                 bind: "pagedown",
-                title: "Scroll commands down",
+                title: t("tui.permissions.key.scrollDown"),
                 run: () => navigation()?.scroll(1),
               },
             ],
@@ -218,7 +218,7 @@ function createControllers(context: Plugin.Context, applied: Applied) {
 function createApplied(context: Plugin.Context): Applied {
   const [sets, setSets] = createStore<Record<string, readonly Preset[]>>({})
   const projects = new Map<string, string>()
-  const quiet = new Set<string>()
+  const quiet = new Map<string, { readonly enabled: boolean }>()
   // Every change to a project's sets or decision (including a reset) publishes `updated`; check it again next time.
   const dispose = context.client.rpc(KiloPermissionsRpc.Definition).events.on("updated", (event) => {
     quiet.delete(event.data.projectID)
@@ -229,11 +229,11 @@ function createApplied(context: Plugin.Context): Applied {
     get: (projectID) => sets[projectID] ?? [],
     quiet: (directory) => {
       const projectID = projects.get(directory)
-      return projectID !== undefined && quiet.has(projectID)
+      return projectID === undefined ? undefined : quiet.get(projectID)
     },
     remember: (directory, projectID, value) => {
       projects.set(directory, projectID)
-      if (value) quiet.add(projectID)
+      if (value) quiet.set(projectID, value)
       else quiet.delete(projectID)
     },
     // A server without the permissions plugin answers with an error or no output, and the sidebar shows no sets.
@@ -290,7 +290,11 @@ function createController(context: Plugin.Context, applied: Applied): Controller
     try {
       const result = await context.client.rpc(KiloPermissionsRpc.Definition).list({}, { location })
       if (generation !== loads) return undefined
-      applied.remember(location.directory, result.projectID, !result.enabled || result.decision !== null)
+      applied.remember(
+        location.directory,
+        result.projectID,
+        !result.enabled || result.decision !== null ? { enabled: result.enabled } : undefined,
+      )
       const normal = { status: "normal", projectID: result.projectID, enabled: result.enabled } as const
       if (!result.enabled) {
         setState(normal)
@@ -352,7 +356,7 @@ function createController(context: Plugin.Context, applied: Applied): Controller
       fail("tui.permissions.saveFailed", offer.projectID)
       return
     }
-    applied.remember(offer.location.directory, offer.projectID, true)
+    applied.remember(offer.location.directory, offer.projectID, { enabled: true })
     if (decision !== "skip") await applied.refresh(offer.location)
     setState({ status: "normal", projectID: offer.projectID })
   }
@@ -364,8 +368,9 @@ function createController(context: Plugin.Context, applied: Applied): Controller
       const generation = ++loads
       // A project known to get no offer shows the normal prompt at once, without a check or a placeholder.
       const known = context.data.session.get(request.sessionID)?.location
-      if (!operation && known && applied.quiet(known.directory)) {
-        setState({ status: "normal" })
+      const quiet = known && applied.quiet(known.directory)
+      if (!operation && quiet) {
+        setState({ status: "normal", enabled: quiet.enabled })
         return
       }
       const waiting = operation
